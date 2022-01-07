@@ -1,49 +1,72 @@
 package main
 
 import (
-	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
+	"github.com/jmoiron/sqlx"
+	"github.com/jmoiron/sqlx/reflectx"
+	_ "github.com/mattn/go-sqlite3"
 )
 
+const schema = `
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS queue (
+	id INTEGER PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS reservation (
+	id INTEGER PRIMARY KEY,
+	queueid INTEGER,
+	position INTEGER,
+	name TEXT NOT NULL,
+	phone TEXT NOT NULL UNIQUE,
+	groupsize INTEGER,
+	FOREIGN KEY (queueid) REFERENCES queue (id) ON DELETE CASCADE
+);
+`
+
 type Queue struct {
-	gorm.Model
+	ID   int64  `json:"id"`
 	Name string `json:"name" binding:"omitempty,min=8"`
 }
 
 type Reservation struct {
-	gorm.Model
-	QueueID   int    `json:"queueID,omitempty"`
+	ID        int64  `json:"id"`
+	QueueID   int64  `json:"queueid,omitempty"`
 	Queue     Queue  `json:"queue,omitempty"`
-	Position  int    `json:"position,omitempty"`
+	Position  int64  `json:"position,omitempty"`
 	Name      string `json:"name" binding:"required,min=8"`
 	Phone     string `json:"phone" binding:"required,min=9"`
-	GroupSize int    `json:"groupSize"`
+	GroupSize int64  `json:"groupsize"`
 }
 
-var db *gorm.DB
+var db *sqlx.DB
 
 // override it for tests
 var database = "./cola.db"
 
+var mu sync.Mutex
+
 func main() {
-	_db, err := gorm.Open(sqlite.Open(database), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Info),
-	})
+
+	// database
+	_db, err := sqlx.Connect("sqlite3", database)
 	if err != nil {
 		panic(err)
 	}
 	db = _db
+	defer db.Close()
 
-	if err := db.AutoMigrate(&Queue{}, &Reservation{}); err != nil {
-		panic(err)
-	}
+	db.Mapper = reflectx.NewMapperFunc("json", strings.ToLower)
+	db.MustExec(schema)
 
+	// API
 	router := gin.Default()
 	v1 := router.Group("/api/v1")
 	{
@@ -68,20 +91,22 @@ func main() {
 }
 
 func createQueue(c *gin.Context) {
-	var newQueue Queue
-	if err := c.BindJSON(&newQueue); err != nil {
+	var q Queue
+	if err := c.BindJSON(&q); err != nil {
 		return
 	}
-	if err := db.Create(&newQueue).Error; err != nil {
-		c.IndentedJSON(http.StatusInternalServerError, newQueue)
+	_, err := db.NamedExec(`INSERT INTO queue (name) VALUES (:name)`, q)
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, q)
 		return
 	}
-	c.IndentedJSON(http.StatusCreated, newQueue)
+	c.IndentedJSON(http.StatusCreated, q)
 }
 
 func getAllQueues(c *gin.Context) {
 	var queues []Queue
-	if err := db.Find(&queues).Error; err != nil {
+	err := db.Select(&queues, "SELECT * FROM queue ORDER BY id ASC")
+	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, queues)
 		return
 	}
@@ -91,7 +116,8 @@ func getAllQueues(c *gin.Context) {
 func getSingleQueue(c *gin.Context) {
 	id := c.Param("id")
 	var q Queue
-	if err := db.Where("id = ?", id).First(&q).Error; err != nil {
+	err := db.Get(&q, "SELECT * FROM queue WHERE id=$1", id)
+	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "reservation not found"})
 		return
 	}
@@ -102,22 +128,31 @@ func getSingleQueue(c *gin.Context) {
 func updateQueue(c *gin.Context) {
 	id := c.Param("id")
 	var q Queue
-	db.Model(&Queue{}).Where("id = ?", id).Updates(&q)
+	_, err := db.Exec(`UPDATE queue SET name=$1 WHERE id = $2`, q.Name, id)
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, q)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": true})
 }
 
 func deleteQueue(c *gin.Context) {
 	id := c.Param("id")
-	var q Queue
-	db.Where("id = ?", id).Delete(&q)
+	res, err := db.Exec("DELETE FROM queue WHERE id=$1", id)
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, res)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": true})
 }
 
 func createReservation(c *gin.Context) {
+	mu.Lock()
+	defer mu.Unlock()
+
 	id := c.Param("id")
 	var r Reservation
 	if err := c.ShouldBindJSON(&r); err != nil {
-		fmt.Println("ERROR", err)
 		c.IndentedJSON(http.StatusConflict, r)
 		return
 	}
@@ -127,28 +162,34 @@ func createReservation(c *gin.Context) {
 		return
 	}
 	// obtain queue
-	r.QueueID = i
-	err = db.Transaction(func(tx *gorm.DB) error {
-		// get the last position in the queue
-		var ids []*int64
-		db.Model(&Reservation{}).Where("queue_id = ?", id).Pluck("MAX(position)", &ids)
-		if len(ids) != 1 {
-			return fmt.Errorf("Can not obtain the last position %v", ids)
-		}
-		r.Position = int(*ids[0]) + 1
-		return db.Create(&r).Error
-	})
+	r.QueueID = int64(i)
+	// get the last position in the queue
+	var pos int64
+	err = db.Get(&pos, "SELECT COALESCE(MAX(position), 0) FROM reservation WHERE queueid=$1", id)
 	if err != nil {
-		c.IndentedJSON(http.StatusInternalServerError, r)
+		c.IndentedJSON(http.StatusInternalServerError, err)
 		return
 	}
+	r.Position = pos + 1
+	// default group size to 1
+	if r.GroupSize == 0 {
+		r.GroupSize = 1
+	}
+	_, err = db.NamedExec(`INSERT INTO reservation (name, queueid, position, phone, groupSize) 
+		VALUES (:name, :queueid, :position, :phone, :groupSize)`, r)
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, err)
+		return
+	}
+
 	c.IndentedJSON(http.StatusCreated, r)
 }
 
 func getAllReservations(c *gin.Context) {
 	id := c.Param("id")
 	var reservations []Reservation
-	if err := db.Find(&reservations).Where("queue_id = ?", id).Error; err != nil {
+	err := db.Select(&reservations, "SELECT * FROM reservation WHERE queueid=$1", id)
+	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, reservations)
 		return
 	}
@@ -160,7 +201,8 @@ func getSingleReservation(c *gin.Context) {
 	id := c.Param("id")
 	rsvp := c.Param("rsvp")
 	var r Reservation
-	if err := db.Where("queue_id = ? AND id = ?", id, rsvp).First(&r).Error; err != nil {
+	err := db.Get(&r, "SELECT * FROM reservation WHERE queueid=$1 AND id=$2", id, rsvp)
+	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "reservation not found"})
 		return
 	}
@@ -171,14 +213,21 @@ func updateReservation(c *gin.Context) {
 	id := c.Param("id")
 	rsvp := c.Param("rsvp")
 	var r Reservation
-	db.Model(&Reservation{}).Where("queue_id = ? AND id = ?", id, rsvp).Updates(&r)
+	_, err := db.Exec(`UPDATE reservation SET name=$1 WHERE queueid=$2 AND id=$3`, r.Name, id, rsvp)
+	if err != nil {
+		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "reservation not found"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": true})
 }
 
 func deleteReservation(c *gin.Context) {
 	id := c.Param("id")
 	rsvp := c.Param("rsvp")
-	var r Reservation
-	db.Where("queue_id = ? AND id = ?", id, rsvp).Delete(&r)
+	res, err := db.Exec("DELETE FROM reservation WHERE queueid=$1 AND id=$2", id, rsvp)
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, res)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": true})
 }
