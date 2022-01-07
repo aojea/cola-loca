@@ -46,56 +46,70 @@ type Reservation struct {
 	GroupSize int64  `json:"groupsize"`
 }
 
-var db *sqlx.DB
-
 // override it for tests
 var database = "./cola.db"
 
-var mu sync.Mutex
-
 func main() {
+	app := NewApp(database)
+	app.Run()
+	app.Stop()
+}
 
+type App struct {
+	mu     sync.Mutex
+	router *gin.Engine
+	db     *sqlx.DB
+}
+
+func NewApp(dbname string) *App {
+	a := &App{}
 	// database
-	_db, err := sqlx.Connect("sqlite3", database)
+	_db, err := sqlx.Connect("sqlite3", dbname)
 	if err != nil {
 		panic(err)
 	}
-	db = _db
-	defer db.Close()
-
-	db.Mapper = reflectx.NewMapperFunc("json", strings.ToLower)
-	db.MustExec(schema)
-
+	a.db = _db
+	a.db.Mapper = reflectx.NewMapperFunc("json", strings.ToLower)
+	a.db.MustExec(schema)
 	// API
-	router := gin.Default()
-	v1 := router.Group("/api/v1")
+	a.router = gin.Default()
+	v1 := a.router.Group("/api/v1")
 	{
 		// queues
-		v1.POST("/queue", createQueue)
-		v1.GET("/queue", getAllQueues)
-		v1.GET("/queue/:id", getSingleQueue)
-		v1.PUT("/queue/:id", updateQueue)
-		v1.DELETE("/queue/:id", deleteQueue)
+		v1.POST("/queue", a.createQueue)
+		v1.GET("/queue", a.getAllQueues)
+		v1.GET("/queue/:id", a.getSingleQueue)
+		v1.PUT("/queue/:id", a.updateQueue)
+		v1.DELETE("/queue/:id", a.deleteQueue)
 		// reservations
-		v1.POST("/queue/:id/reservation", createReservation)
-		v1.GET("/queue/:id/reservation", getAllReservations)
-		v1.GET("/queue/:id/reservation/:rsvp", getSingleReservation)
-		v1.PUT("/queue/:id/reservation/:rsvp", updateReservation)
-		v1.DELETE("/queue/:id/reservation/:rsvp", deleteReservation)
+		v1.POST("/queue/:id/reservation", a.createReservation)
+		v1.GET("/queue/:id/reservation", a.getAllReservations)
+		v1.GET("/queue/:id/reservation/:rsvp", a.getSingleReservation)
+		v1.PUT("/queue/:id/reservation/:rsvp", a.updateReservation)
+		v1.DELETE("/queue/:id/reservation/:rsvp", a.deleteReservation)
 	}
 
-	router.GET("/healthz", func(c *gin.Context) {
+	a.router.GET("/healthz", func(c *gin.Context) {
 		c.String(200, "ok")
 	})
-	router.Run(":3000")
+	return a
 }
 
-func createQueue(c *gin.Context) {
+func (a *App) Run() {
+	a.router.Run(":3000")
+}
+
+func (a *App) Stop() {
+	a.db.Close()
+}
+
+// http handlers
+func (a *App) createQueue(c *gin.Context) {
 	var q Queue
 	if err := c.BindJSON(&q); err != nil {
 		return
 	}
-	_, err := db.NamedExec(`INSERT INTO queue (name) VALUES (:name)`, q)
+	_, err := a.db.NamedExec(`INSERT INTO queue (name) VALUES (:name)`, q)
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, q)
 		return
@@ -103,9 +117,9 @@ func createQueue(c *gin.Context) {
 	c.IndentedJSON(http.StatusCreated, q)
 }
 
-func getAllQueues(c *gin.Context) {
+func (a *App) getAllQueues(c *gin.Context) {
 	var queues []Queue
-	err := db.Select(&queues, "SELECT * FROM queue ORDER BY id ASC")
+	err := a.db.Select(&queues, "SELECT * FROM queue ORDER BY id ASC")
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, queues)
 		return
@@ -113,10 +127,10 @@ func getAllQueues(c *gin.Context) {
 	c.IndentedJSON(http.StatusOK, queues)
 }
 
-func getSingleQueue(c *gin.Context) {
+func (a *App) getSingleQueue(c *gin.Context) {
 	id := c.Param("id")
 	var q Queue
-	err := db.Get(&q, "SELECT * FROM queue WHERE id=$1", id)
+	err := a.db.Get(&q, "SELECT * FROM queue WHERE id=$1", id)
 	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "reservation not found"})
 		return
@@ -125,10 +139,10 @@ func getSingleQueue(c *gin.Context) {
 
 }
 
-func updateQueue(c *gin.Context) {
+func (a *App) updateQueue(c *gin.Context) {
 	id := c.Param("id")
 	var q Queue
-	_, err := db.Exec(`UPDATE queue SET name=$1 WHERE id = $2`, q.Name, id)
+	_, err := a.db.Exec(`UPDATE queue SET name=$1 WHERE id = $2`, q.Name, id)
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, q)
 		return
@@ -136,9 +150,9 @@ func updateQueue(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": true})
 }
 
-func deleteQueue(c *gin.Context) {
+func (a *App) deleteQueue(c *gin.Context) {
 	id := c.Param("id")
-	res, err := db.Exec("DELETE FROM queue WHERE id=$1", id)
+	res, err := a.db.Exec("DELETE FROM queue WHERE id=$1", id)
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, res)
 		return
@@ -146,9 +160,9 @@ func deleteQueue(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": true})
 }
 
-func createReservation(c *gin.Context) {
-	mu.Lock()
-	defer mu.Unlock()
+func (a *App) createReservation(c *gin.Context) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	id := c.Param("id")
 	var r Reservation
@@ -165,7 +179,7 @@ func createReservation(c *gin.Context) {
 	r.QueueID = int64(i)
 	// get the last position in the queue
 	var pos int64
-	err = db.Get(&pos, "SELECT COALESCE(MAX(position), 0) FROM reservation WHERE queueid=$1", id)
+	err = a.db.Get(&pos, "SELECT COALESCE(MAX(position), 0) FROM reservation WHERE queueid=$1", id)
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, err)
 		return
@@ -175,7 +189,7 @@ func createReservation(c *gin.Context) {
 	if r.GroupSize == 0 {
 		r.GroupSize = 1
 	}
-	_, err = db.NamedExec(`INSERT INTO reservation (name, queueid, position, phone, groupSize) 
+	_, err = a.db.NamedExec(`INSERT INTO reservation (name, queueid, position, phone, groupSize) 
 		VALUES (:name, :queueid, :position, :phone, :groupSize)`, r)
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, err)
@@ -185,10 +199,10 @@ func createReservation(c *gin.Context) {
 	c.IndentedJSON(http.StatusCreated, r)
 }
 
-func getAllReservations(c *gin.Context) {
+func (a *App) getAllReservations(c *gin.Context) {
 	id := c.Param("id")
 	var reservations []Reservation
-	err := db.Select(&reservations, "SELECT * FROM reservation WHERE queueid=$1", id)
+	err := a.db.Select(&reservations, "SELECT * FROM reservation WHERE queueid=$1", id)
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, reservations)
 		return
@@ -197,11 +211,11 @@ func getAllReservations(c *gin.Context) {
 
 }
 
-func getSingleReservation(c *gin.Context) {
+func (a *App) getSingleReservation(c *gin.Context) {
 	id := c.Param("id")
 	rsvp := c.Param("rsvp")
 	var r Reservation
-	err := db.Get(&r, "SELECT * FROM reservation WHERE queueid=$1 AND id=$2", id, rsvp)
+	err := a.db.Get(&r, "SELECT * FROM reservation WHERE queueid=$1 AND id=$2", id, rsvp)
 	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "reservation not found"})
 		return
@@ -209,11 +223,11 @@ func getSingleReservation(c *gin.Context) {
 	c.IndentedJSON(http.StatusOK, r)
 }
 
-func updateReservation(c *gin.Context) {
+func (a *App) updateReservation(c *gin.Context) {
 	id := c.Param("id")
 	rsvp := c.Param("rsvp")
 	var r Reservation
-	_, err := db.Exec(`UPDATE reservation SET name=$1 WHERE queueid=$2 AND id=$3`, r.Name, id, rsvp)
+	_, err := a.db.Exec(`UPDATE reservation SET name=$1 WHERE queueid=$2 AND id=$3`, r.Name, id, rsvp)
 	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "reservation not found"})
 		return
@@ -221,10 +235,10 @@ func updateReservation(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": true})
 }
 
-func deleteReservation(c *gin.Context) {
+func (a *App) deleteReservation(c *gin.Context) {
 	id := c.Param("id")
 	rsvp := c.Param("rsvp")
-	res, err := db.Exec("DELETE FROM reservation WHERE queueid=$1 AND id=$2", id, rsvp)
+	res, err := a.db.Exec("DELETE FROM reservation WHERE queueid=$1 AND id=$2", id, rsvp)
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, res)
 		return
