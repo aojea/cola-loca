@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -29,7 +29,7 @@ func testHTTPResponse(t *testing.T, r *gin.Engine, req *http.Request, f func(w *
 	// Create the service and process the above request.
 	r.ServeHTTP(w, req)
 	if !f(w) {
-		t.Fail()
+		t.Fatal(w, req)
 	}
 }
 
@@ -40,27 +40,32 @@ func TestCreateQueue(t *testing.T) {
 	testApp := NewApp("file::memory:?cache=shared")
 
 	// Create a request to send to the above route
-	req, err := http.NewRequest("POST", "/api/v1/queue", strings.NewReader(`"name":"testq1"`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := `{"name":"my_login2"}`
+	req := httptest.NewRequest("POST", "/api/v1/queue", strings.NewReader(data))
+	req.Header.Add("Content-Type", "application/json")
 	testHTTPResponse(t, testApp.router, req, func(w *httptest.ResponseRecorder) bool {
-		statusOK := w.Code == http.StatusOK
+		statusOK := w.Code == http.StatusCreated
 		return statusOK
 	})
 
 	// Create a request to send to the above route
-	req, err = http.NewRequest("GET", "/api/v1/queue/1", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	req = httptest.NewRequest("GET", "/api/v1/queue", nil)
 	testHTTPResponse(t, testApp.router, req, func(w *httptest.ResponseRecorder) bool {
 		statusOK := w.Code == http.StatusOK
 
+		var q []Queue
 		p, err := ioutil.ReadAll(w.Body)
-		pageOK := err == nil && strings.Index(string(p), "<title>Register</title>") > 0
-		fmt.Println(string(p))
-		return statusOK && pageOK
+		if err != nil {
+			return false
+		}
+		err = json.Unmarshal(p, &q)
+		if err != nil {
+			return false
+		}
+		if len(q) != 1 || q[0].Name != "my_login2" {
+			return false
+		}
+		return statusOK
 	})
 
 }

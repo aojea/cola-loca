@@ -140,7 +140,6 @@ func (a *App) Run(ctx context.Context) {
 	case <-ctx.Done():
 	}
 	a.db.Close()
-
 }
 
 // http handlers
