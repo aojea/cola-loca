@@ -1,7 +1,12 @@
 package main
 
 import (
+	"context"
+	"flag"
+	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
@@ -10,7 +15,15 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/jmoiron/sqlx/reflectx"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/sys/unix"
 )
+
+var database string
+
+func init() {
+	flag.StringVar(&database, "database", "./cola.db", "Specify the database filename. Default ./cola.db")
+
+}
 
 const schema = `
 PRAGMA foreign_keys = ON;
@@ -46,13 +59,30 @@ type Reservation struct {
 	GroupSize int64  `json:"groupsize"`
 }
 
-// override it for tests
-var database = "./cola.db"
-
 func main() {
+	flag.Parse()
+	// trap Ctrl+C and call cancel on the context
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+
+	// Enable signal handler
+	signalCh := make(chan os.Signal, 2)
+	defer func() {
+		close(signalCh)
+		cancel()
+	}()
+
+	signal.Notify(signalCh, os.Interrupt, unix.SIGINT)
+	go func() {
+		select {
+		case <-signalCh:
+			log.Printf("Exiting: received signal")
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	app := NewApp(database)
-	app.Run()
-	app.Stop()
+	app.Run(ctx)
 }
 
 type App struct {
@@ -95,12 +125,22 @@ func NewApp(dbname string) *App {
 	return a
 }
 
-func (a *App) Run() {
-	a.router.Run(":3000")
-}
+func (a *App) Run(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		err := a.router.Run(":3000")
+		if err != nil {
+			log.Printf("Error stopping http server: %v", err)
+		}
+		close(done)
+	}()
 
-func (a *App) Stop() {
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 	a.db.Close()
+
 }
 
 // http handlers
